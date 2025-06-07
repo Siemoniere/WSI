@@ -1,33 +1,48 @@
 import numpy as np
 from tensorflow.keras.datasets import mnist
-from sklearn.decomposition import PCA
+import umap
 from scipy.stats import mode
 from sklearn.neighbors import NearestNeighbors
+import random
+import os
 
-# Wczytanie i przygotowanie danych
+seed = 42
+os.environ['PYTHONHASHSEED'] = str(seed)
+random.seed(seed)
+np.random.seed(seed)
+
 (X_train, y_train), (X_test, y_test) = mnist.load_data()
-X = np.concatenate((X_train, X_test), axis=0)
-y = np.concatenate((y_train, y_test), axis=0)
+X = np.concatenate((X_train, X_test))
+y = np.concatenate((y_train, y_test))
 X = X.reshape(X.shape[0], -1) / 255.0
 
-def cluster_accuracy(labels_true, labels_pred):
-    clusters = set(labels_pred)
+idx = np.random.choice(len(X), size=20000, replace=False)
+X_sample = X[idx]
+y_sample = y[idx]
+
+reducer = umap.UMAP(n_components=10, n_neighbors=15, random_state=seed)
+X_umap = reducer.fit_transform(X_sample)
+
+def cluster_accuracy(true_labels, pred_labels):
+    clusters = set(pred_labels)
     clusters.discard(-1)
     total_correct = 0
     total_points = 0
     error_points = 0
     for cluster in clusters:
-        indices = np.where(labels_pred == cluster)[0]
-        true_labels_in_cluster = labels_true[indices]
-        dominant_label = mode(true_labels_in_cluster, keepdims=True).mode[0]
-        correct = np.sum(true_labels_in_cluster == dominant_label)
+        indices = np.where(pred_labels == cluster)[0]
+        if len(indices) == 0:
+            continue
+        cluster_true = true_labels[indices]
+        majority = mode(cluster_true, keepdims=True).mode[0]
+        correct = np.sum(cluster_true == majority)
         total_correct += correct
         total_points += len(indices)
         error_points += len(indices) - correct
-    accuracy = total_correct / total_points if total_points > 0 else 0
-    noise_percent = np.sum(labels_pred == -1) / len(labels_pred) * 100
-    error_percent = error_points / total_points * 100 if total_points > 0 else 0
-    return accuracy, noise_percent, error_percent
+    accuracy = total_correct / total_points if total_points else 0
+    noise = np.sum(pred_labels == -1) / len(pred_labels) * 100
+    error_rate = error_points / total_points * 100 if total_points else 0
+    return accuracy, noise, error_rate, len(clusters)
 
 def dbscan_manual(X, eps, min_samples):
     n = X.shape[0]
@@ -35,7 +50,6 @@ def dbscan_manual(X, eps, min_samples):
     visited = np.zeros(n, dtype=bool)
     cluster_id = 0
 
-    # Użycie NearestNeighbors do przyspieszenia
     nn = NearestNeighbors(radius=eps, n_jobs=-1)
     nn.fit(X)
     neighbors = nn.radius_neighbors(X, return_distance=False)
@@ -46,7 +60,7 @@ def dbscan_manual(X, eps, min_samples):
         visited[i] = True
         neigh = neighbors[i]
         if len(neigh) < min_samples:
-            continue
+            continue  # punkt jest szumem lub brzegiem
 
         labels[i] = cluster_id
         seeds = list(neigh)
@@ -63,58 +77,35 @@ def dbscan_manual(X, eps, min_samples):
             if labels[j] == -1:
                 labels[j] = cluster_id
         cluster_id += 1
+
     return labels
 
-pca_values = [10, 20, 30, 40, 50]
-eps_values = np.linspace(1.5, 3.5, 9)
-min_samples_values = [3, 5, 10]
+eps_values = np.arange(0.2, 0.6, 0.05)
+min_samples_values = range(3, 12)
 
-best_result = None
+best_acc = 0
+best_params = None
 
-print("Strojenie PCA, eps i min_samples (manual DBSCAN)...")
+print("Szukanie najlepszych parametrów manual DBSCAN...")
 
-for seed in range(5):
-    np.random.seed(seed)
-    idx = np.random.choice(len(X), size=10000, replace=False)
-    X_sample = X[idx]
-    y_sample = y[idx]
+for eps in eps_values:
+    for min_samples in min_samples_values:
+        labels = dbscan_manual(X_umap, eps, min_samples)
+        acc, noise, error, n_clusters = cluster_accuracy(y_sample, labels)
+        
+        if acc > best_acc and n_clusters >= 6 and n_clusters <= 30:
+            best_acc = acc
+            best_params = (eps, min_samples, n_clusters, acc, noise, error)
+            print(f"Nowy najlepszy wynik: eps={eps:.2f}, min_samples={min_samples} -> "
+                  f"acc={acc*100:.2f}%, clusters={n_clusters}, noise={noise:.2f}%")
 
-    for pca_dim in pca_values:
-        pca = PCA(n_components=pca_dim)
-        X_pca = pca.fit_transform(X_sample)
-
-        for eps in eps_values:
-            for min_samples in min_samples_values:
-                labels = dbscan_manual(X_pca, eps, min_samples)
-                n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-                if n_clusters < 10 or n_clusters > 30:
-                    continue
-                accuracy, noise, errors = cluster_accuracy(y_sample, labels)
-                print(f"Seed={seed} | PCA={pca_dim}, eps={eps:.2f}, min_samples={min_samples} | "
-                      f"klastry={n_clusters}, dokładność={accuracy*100:.2f}%, "
-                      f"szum={noise:.2f}%, błędy={errors:.2f}%")
-                if best_result is None or (accuracy > best_result['accuracy'] and noise < best_result['noise_percent']):
-                    best_result = {
-                        'seed': seed,
-                        'pca_dim': pca_dim,
-                        'eps': eps,
-                        'min_samples': min_samples,
-                        'n_clusters': n_clusters,
-                        'accuracy': accuracy,
-                        'noise_percent': noise,
-                        'error_percent': errors,
-                        'labels': labels
-                    }
-
-if best_result:
-    print("\nNajlepszy wynik:")
-    print(f"Seed: {best_result['seed']}")
-    print(f"PCA: {best_result['pca_dim']}")
-    print(f"eps: {best_result['eps']}")
-    print(f"min_samples: {best_result['min_samples']}")
-    print(f"Liczba klastrów: {best_result['n_clusters']}")
-    print(f"Dokładność: {best_result['accuracy']*100:.2f}%")
-    print(f"Procent szumu: {best_result['noise_percent']:.2f}%")
-    print(f"Procent błędów: {best_result['error_percent']:.2f}%")
+if best_params is not None:
+    print("\nNajlepsze parametry:")
+    print(f"eps = {best_params[0]:.2f}")
+    print(f"min_samples = {best_params[1]}")
+    print(f"liczba klastrów = {best_params[2]}")
+    print(f"dokładność = {best_params[3]*100:.2f}%")
+    print(f"procent szumu = {best_params[4]:.2f}%")
+    print(f"procent błędów = {best_params[5]:.2f}%")
 else:
     print("Nie znaleziono parametrów spełniających kryteria.")
